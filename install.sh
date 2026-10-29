@@ -1,5 +1,5 @@
 #!/bin/sh
-# install.sh — установка Podkop с поддержкой подписок
+# install.sh — установка Podkop с поддержкой подписок (Alpine-based OpenWrt)
 
 set -e
 
@@ -13,10 +13,10 @@ if [ ! -f /etc/openwrt_release ]; then
     exit 1
 fi
 
-# Зависимости
+# Зависимости (apk вместо opkg)
 echo "🔧 Установка зависимостей..."
-opkg update
-opkg install sing-box curl jq coreutils-base64 bind-dig
+apk update
+apk add sing-box curl jq coreutils-base64 bind-tools
 
 # Скачиваем последний архив с файлами
 echo "🔍 Поиск последнего релиза..."
