@@ -31,7 +31,7 @@ opkg install sing-box curl jq coreutils-base64 bind-dig
 
 # Получаем ссылку на последний .ipk для нашей архитектуры
 echo "🔍 Поиск последней версии для архитектуры $ARCH_SLUG..."
-IPK_URL="$(curl -s "$LATEST_URL" | jq -r --arch "$ARCH_SLUG" '.assets[] | select(.name | test("'"$ARCH_SLUG"'")) | .browser_download_url' | head -n1)"
+IPK_URL="$(curl -s "$LATEST_URL" | jq -r --arg arch "$ARCH_SLUG" '.assets[] | select(.name | test($arch)) | .browser_download_url' | head -n1)"
 
 if [ -z "$IPK_URL" ]; then
     echo "❌ Не найден .ipk для архитектуры $ARCH_SLUG в последнем релизе."
