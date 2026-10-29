@@ -1,0 +1,27 @@
+name: Release Podkop
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create release archive
+        run: |
+          VERSION="${GITHUB_REF#refs/tags/}"
+          mkdir -p release
+          cd podkop/files
+          tar -czf "../../release/podkop-${VERSION}.tar.gz" etc usr
+          cd ../..
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release/podkop-*.tar.gz
+          generate_release_notes: true
