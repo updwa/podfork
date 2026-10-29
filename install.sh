@@ -1,5 +1,5 @@
 #!/bin/sh
-# install.sh — установка Podkop с поддержкой подписок (Alpine-based OpenWrt)
+# install.sh — одна команда, без костылей (Alpine-based OpenWrt)
 
 set -e
 
@@ -13,28 +13,31 @@ if [ ! -f /etc/openwrt_release ]; then
     exit 1
 fi
 
-# Зависимости (apk вместо opkg)
+# Зависимости
 echo "🔧 Установка зависимостей..."
 apk update
 apk add sing-box curl jq coreutils-base64 bind-tools
 
-# Скачиваем последний архив с файлами
-echo "🔍 Поиск последнего релиза..."
-ARCHIVE_URL="$(curl -s "$LATEST_URL" | jq -r '.assets[] | select(.name | endswith(".tar.gz")) | .browser_download_url' | head -n1)"
+# Получаем тег последнего релиза
+echo "🔍 Поиск последнего реLEASE..."
+TAG_NAME="$(curl -s "$LATEST_URL" | jq -r '.tag_name')"
 
-if [ -z "$ARCHIVE_URL" ]; then
-    echo "❌ Не найден архив в последнем релизе."
-    echo "   Доступные ассеты:"
-    curl -s "$LATEST_URL" | jq -r '.assets[].name'
+if [ -z "$TAG_NAME" ] || [ "$TAG_NAME" = "null" ]; then
+    echo "❌ Не найден последний релиз."
     exit 1
 fi
+
+echo "🏷️  Тег релиза: $TAG_NAME"
+
+# Скачиваем исходный код релиза (GitHub авто-архив tar.gz)
+ARCHIVE_URL="https://github.com/updwa/podfork/archive/refs/tags/${TAG_NAME}.tar.gz"
 
 echo "⬇️  Скачивание: $ARCHIVE_URL"
 wget -O /tmp/podkop.tar.gz "$ARCHIVE_URL"
 
-echo "📦 Распаковка файлов..."
+echo "📦 Распаковка в корень..."
 cd /
-tar -xzf /tmp/podkop.tar.gz
+tar -xzf /tmp/podkop.tar.gz --strip-components=1
 rm -f /tmp/podkop.tar.gz
 
 echo "🚀 Запуск сервиса..."
@@ -42,7 +45,7 @@ echo "🚀 Запуск сервиса..."
 /etc/init.d/podkop start
 
 echo ""
-echo "🎉 Установка завершена!"
+echo "🎉 Готово!"
 echo ""
 echo "Настройте подписку в /etc/config/podkop:"
 echo "  config section 'my_subscription'"
@@ -50,8 +53,6 @@ echo "      option connection_type 'proxy'"
 echo "      option proxy_config_type 'subscription'"
 echo "      list subscription_url 'https://ваш-провайдер.com/api/sub'"
 echo ""
-echo "Затем обновите подписки:"
-echo "  /usr/bin/podkop subscription_update"
+echo "Затем: /usr/bin/podkop subscription_update"
 echo ""
-echo "Или проверьте пинг серверов:"
-echo "  /usr/bin/podkop subscription_url_test my_subscription"
+echo "Или проверьте пинг: /usr/bin/podkop subscription_url_test my_subscription"
