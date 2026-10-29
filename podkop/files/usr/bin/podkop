@@ -20,6 +20,8 @@ check_required_file "$PODKOP_LIB/sing_box_config_manager.sh"
 check_required_file "$PODKOP_LIB/sing_box_config_facade.sh"
 check_required_file "$PODKOP_LIB/logging.sh"
 check_required_file "$PODKOP_LIB/rulesets.sh"
+check_required_file "$PODKOP_LIB/subinfo.sh"
+check_required_file "$PODKOP_LIB/feedlist.sh"
 . /lib/functions.sh
 . /lib/config/uci.sh
 . /lib/functions/network.sh
@@ -30,8 +32,14 @@ check_required_file "$PODKOP_LIB/rulesets.sh"
 . "$PODKOP_LIB/sing_box_config_facade.sh"
 . "$PODKOP_LIB/logging.sh"
 . "$PODKOP_LIB/rulesets.sh"
+. "$PODKOP_LIB/subinfo.sh"
+. "$PODKOP_LIB/feedlist.sh"
 
 config_load "$PODKOP_CONFIG"
+
+# Normalize legacy scalar `option subscription_url` to the canonical `list`
+# shape BEFORE check_requirements / config generation read the URLs.
+migrate_legacy_subscription_url_option
 
 check_requirements() {
     log "Check Requirements"
@@ -126,6 +134,11 @@ start_main() {
     mkdir -p "$TMP_SING_BOX_FOLDER"
     mkdir -p "$TMP_RULESET_FOLDER"
 
+    # Subscription caches: prepare per-URL caches before building the config.
+    ensure_subscription_cache_dir
+    migrate_subscription_cache_from_tmp
+    prepare_subscription_caches_for_startup
+
     # base
     route_table_rule_mark
     create_nft_rules
@@ -134,6 +147,7 @@ start_main() {
     # sing-box
     sing_box_init_config
     config_foreach add_cron_job "section"
+    sync_subscription_cron_jobs
     /etc/init.d/sing-box start
 
     log "Nice"
@@ -475,8 +489,55 @@ add_cron_job() {
 }
 
 remove_cron_job() {
-    (crontab -l | grep -v "/usr/bin/podkop list_update") | crontab -
+    (crontab -l | grep -v "/usr/bin/podkop list_update" | grep -v "/usr/bin/podkop subscription_update") | crontab -
     log "The cron job removed"
+}
+
+sync_subscription_cron_jobs() {
+    local intervals="" interval cron_line section
+    local seen=""
+
+    # Collect distinct subscription_update_interval values from all subscription sections
+    config_foreach _collect_subscription_intervals "section"
+
+    # Build cron lines for each distinct interval
+    for interval in $intervals; do
+        cron_line="$(get_subscription_cron_line_for_interval "$interval")"
+        [ -n "$cron_line" ] || continue
+        case " $seen " in
+        *" $cron_line "*) continue ;;
+        esac
+        seen="$seen $cron_line "
+        remove_cron_job_internal
+        crontab -l 2>/dev/null | {
+            cat
+            echo "$cron_line"
+        } | crontab -
+        log "Subscription cron job created: $cron_line"
+    done
+}
+
+_collect_subscription_intervals() {
+    local section="$1"
+    local connection_type proxy_config_type subscription_update_interval
+
+    config_get connection_type "$section" "connection_type"
+    [ "$connection_type" = "proxy" ] || return 0
+
+    config_get proxy_config_type "$section" "proxy_config_type"
+    [ "$proxy_config_type" = "subscription" ] || return 0
+
+    config_get subscription_update_interval "$section" "subscription_update_interval" "$SUBSCRIPTION_UPDATE_INTERVAL_DEFAULT"
+    if ! get_subscription_cron_line_for_interval "$subscription_update_interval" > /dev/null 2>&1; then
+        subscription_update_interval="$SUBSCRIPTION_UPDATE_INTERVAL_DEFAULT"
+    fi
+
+    # Add to the intervals list (dedup via caller)
+    intervals="$intervals $subscription_update_interval"
+}
+
+remove_cron_job_internal() {
+    (crontab -l 2>/dev/null | grep -v "/usr/bin/podkop list_update" | grep -v "/usr/bin/podkop subscription_update") | crontab -
 }
 
 list_update() {
@@ -740,6 +801,64 @@ configure_outbound_handler() {
                 "$urltest_testing_url" "$urltest_check_interval" "$urltest_tolerance" "" "" \
                 "$urltest_fallbacks" "$urltest_download_check" "$urltest_download_url")"
             config="$(sing_box_cm_add_selector_outbound "$config" "$selector_tag" "$selector_outbounds" "$urltest_tag")"
+            ;;
+        subscription)
+            log "Detected proxy configuration type: subscription" "debug"
+            local subscription_urls url urlhash subscription_json_path include_kw_json exclude_kw_json
+            config_get subscription_urls "$section" "subscription_url"
+
+            if [ -z "$subscription_urls" ]; then
+                log "Subscription URL is not set for section '$section'. Aborted." "fatal"
+                exit 1
+            fi
+
+            # Build keyword filter JSON from UCI options
+            local include_kws exclude_kws
+            include_kws=""
+            exclude_kws=""
+            config_list_foreach "$section" "subscription_filter_include_keywords" _append_kw_array include_kws
+            config_list_foreach "$section" "subscription_filter_exclude_keywords" _append_kw_array exclude_kws
+
+            include_kw_json="$(printf '%s' "$include_kws" | jq -R -s -c 'split("\n") | map(select(length > 0))' 2>/dev/null)"
+            exclude_kw_json="$(printf '%s' "$exclude_kws" | jq -R -s -c 'split("\n") | map(select(length > 0))' 2>/dev/null)"
+            [ -n "$include_kw_json" ] || include_kw_json="[]"
+            [ -n "$exclude_kw_json" ] || exclude_kw_json="[]"
+
+            # For each subscription URL, add outbounds from the cached feed
+            local urls_tmp
+            urls_tmp="$(mktemp "${TMPDIR:-/tmp}/podkop-sub-cfg.XXXXXX")" || {
+                log "Failed to create temporary URL list for section '$section'" "error"
+                exit 1
+            }
+            get_subscription_urls_for_section "$section" > "$urls_tmp"
+
+            local section_has_outbound=0
+            while IFS= read -r url || [ -n "$url" ]; do
+                [ -n "$url" ] || continue
+                urlhash="$(get_subscription_url_hash "$url")"
+                subscription_json_path="$(get_subscription_json_path "$section" "$urlhash")"
+
+                if ! subscription_cache_is_usable "$subscription_json_path"; then
+                    log "Subscription cache for section '$section' feed is not usable: url=$(redact_url_for_log "$url")" "warn"
+                    continue
+                fi
+
+                config="$(sing_box_cf_add_subscription_outbounds "$config" "$section" "$subscription_json_path" \
+                    "$include_kw_json" "$exclude_kw_json")" || {
+                    log "Failed to add subscription outbounds for section '$section' feed: url=$(redact_url_for_log "$url")" "warn"
+                    continue
+                }
+
+                if [ -n "$SUBSCRIPTION_OUTBOUND_TAGS" ]; then
+                    section_has_outbound=1
+                fi
+            done < "$urls_tmp"
+            rm -f "$urls_tmp"
+
+            if [ "$section_has_outbound" -eq 0 ]; then
+                log "No usable subscription outbounds for section '$section'; traffic will be rejected" "warn"
+                mark_section_outbound_unavailable "$section"
+            fi
             ;;
         *)
             log "Unknown proxy configuration type: '$proxy_config_type'. Aborted." "fatal"
@@ -1550,6 +1669,16 @@ import_subnets_from_remote_plain_file() {
 }
 
 ## Support functions
+_append_kw_array() {
+    local arr="$1" kw="$2"
+    if [ -z "$arr" ]; then
+        printf '%s' "$kw"
+    else
+        printf '%s
+%s' "$arr" "$kw"
+    fi
+}
+
 get_service_proxy_address() {
     local download_lists_via_proxy
     config_get_bool download_lists_via_proxy "settings" "download_lists_via_proxy" 0
@@ -2698,6 +2827,314 @@ global_check() {
     fi
 }
 
+# Reload sing-box config in place (without full service restart).
+reload_sing_box_config_in_place() {
+    local sing_box_config_path
+    config_get sing_box_config_path "settings" "config_path"
+
+    if [ ! -f "$sing_box_config_path" ]; then
+        log "Cannot reload: sing-box config file not found" "error"
+        return 1
+    fi
+
+    if ! sing-box -c "$sing_box_config_path" check > /dev/null 2>&1; then
+        log "Cannot reload: sing-box config is invalid" "error"
+        return 1
+    fi
+
+    # Signal sing-box to reload via Clash API or restart
+    if pgrep -f "sing-box" > /dev/null 2>&1; then
+        log "Reloading sing-box configuration" "info"
+        /etc/init.d/sing-box reload 2>/dev/null || /etc/init.d/sing-box restart 2>/dev/null
+    else
+        log "sing-box is not running; config will be applied on next start" "warn"
+    fi
+    return 0
+}
+
+# The entry point of every subscription update (cron, CLI, deferred startup).
+subscription_update() {
+    local update_rc
+
+    subscription_update_lock_acquire "${SUBSCRIPTION_UPDATE_LOCK_MODE:-wait}"
+    update_rc=$?
+    if [ "$update_rc" -ne 0 ]; then
+        subscription_update_lock_refused "$update_rc"
+        return $?
+    fi
+
+    subscription_update_unlocked "$@"
+    update_rc=$?
+
+    subscription_update_lock_release
+    return "$update_rc"
+}
+
+# Updates every subscription section (or only the sections whose
+# subscription_update_interval matches the argument).
+subscription_update_unlocked() {
+    local target_interval="${1:-}"
+    local target_time="${2:-}"
+    local target_section="${3:-}"
+    local target_url="${4:-}"
+    local has_subscription=0
+    local updated_sections=0
+    local failed_sections=0
+    local section_changed names_changed
+    local fingerprint_before
+
+    if [ -n "$target_interval" ] && ! get_subscription_cron_line_for_interval "$target_interval" > /dev/null 2>&1; then
+        log "Unknown subscription update interval '$target_interval', updating every subscription section" "warn"
+        target_interval=""
+    fi
+
+    _subscription_section_selected() {
+        local section="$1"
+        local connection_type proxy_config_type subscription_update_interval
+
+        config_get connection_type "$section" "connection_type"
+        [ "$connection_type" = "proxy" ] || return 1
+
+        config_get proxy_config_type "$section" "proxy_config_type"
+        [ "$proxy_config_type" = "subscription" ] || return 1
+
+        if [ -n "$target_interval" ]; then
+            config_get subscription_update_interval "$section" "subscription_update_interval" "$SUBSCRIPTION_UPDATE_INTERVAL_DEFAULT"
+            if ! get_subscription_cron_line_for_interval "$subscription_update_interval" > /dev/null 2>&1; then
+                subscription_update_interval="$SUBSCRIPTION_UPDATE_INTERVAL_DEFAULT"
+            fi
+            [ "$subscription_update_interval" = "$target_interval" ] || return 1
+
+            if [ -n "$target_time" ]; then
+                [ "$(get_section_subscription_update_time "$section")" = "$target_time" ] || return 1
+            fi
+        fi
+
+        if [ -n "$target_section" ] && [ "$section" != "$target_section" ]; then
+            return 1
+        fi
+
+        return 0
+    }
+
+    _check_subscription_section() {
+        local section="$1"
+        _subscription_section_selected "$section" || return
+        has_subscription=1
+    }
+    config_foreach _check_subscription_section "section"
+
+    if [ "$has_subscription" -eq 0 ]; then
+        log "No subscription sections found, nothing to update"
+        return 0
+    fi
+
+    _update_subscription_for_section() {
+        local section="$1"
+        local url urlhash subscription_json_path subscription_url_cache_path
+        local service_proxy_address update_result outbounds_count
+        local urls_tmp url_count selected_count
+        local names_changed=0
+
+        _subscription_section_selected "$section" || return
+
+        mkdir -p "$TMP_SUBSCRIPTION_FOLDER"
+        if ! ensure_subscription_cache_dir; then
+            log "Subscription cache directory is unavailable for section '$section'" "error"
+            failed_sections=$((failed_sections + 1))
+            return
+        fi
+        reap_legacy_subscription_cache_files "$section"
+
+        urls_tmp="$(mktemp "${TMPDIR:-/tmp}/podkop-refresh-urls.XXXXXX")" || {
+            log "Failed to enumerate subscription URLs for section '$section'" "error"
+            failed_sections=$((failed_sections + 1))
+            return
+        }
+        get_subscription_urls_for_section "$section" > "$urls_tmp"
+        url_count=0
+        selected_count=0
+        while IFS= read -r url || [ -n "$url" ]; do
+            [ -n "$url" ] || continue
+            url_count=$((url_count + 1))
+            if [ -z "$target_url" ] || [ "$url" = "$target_url" ]; then
+                selected_count=$((selected_count + 1))
+            fi
+        done < "$urls_tmp"
+
+        if [ "$url_count" -eq 0 ]; then
+            rm -f "$urls_tmp"
+            log "Subscription URL not set for section '$section'" "error"
+            failed_sections=$((failed_sections + 1))
+            return
+        fi
+
+        if [ -n "$target_url" ]; then
+            log "Updating subscription for section '$section' ($selected_count of $url_count feed(s))..."
+        else
+            log "Updating subscription for section '$section' ($url_count feed(s))..."
+        fi
+
+        section_changed=0
+        while IFS= read -r url || [ -n "$url" ]; do
+            [ -n "$url" ] || continue
+            if [ -n "$target_url" ] && [ "$url" != "$target_url" ]; then
+                continue
+            fi
+            urlhash="$(get_subscription_url_hash "$url")"
+            subscription_json_path="$(get_subscription_json_path "$section" "$urlhash")"
+            subscription_url_cache_path="$(get_subscription_url_cache_path "$section" "$urlhash")"
+
+            service_proxy_address="$(get_subscription_download_proxy_address "$section" "runtime" || echo '')"
+
+            if ! wait_for_subscription_connectivity "$section" "$url" "$service_proxy_address" 6 5 5; then
+                log "Subscription feed not reachable for section '$section': url=$(redact_url_for_log "$url")" "warn"
+                subscription_cache_is_usable "$subscription_json_path" && continue
+                continue
+            fi
+
+            fingerprint_before=""
+            if [ -n "$target_interval" ] && [ -s "$subscription_json_path" ]; then
+                fingerprint_before="$(subscription_nodes_fingerprint "$subscription_json_path")"
+            fi
+
+            download_subscription_into_cache \
+                "$section" "$url" "$subscription_json_path" "$subscription_url_cache_path" "$service_proxy_address" "$urlhash"
+            update_result=$?
+
+            if [ "$update_result" -eq 0 ] && [ -n "$fingerprint_before" ] &&
+                [ "$fingerprint_before" = "$(subscription_nodes_fingerprint "$subscription_json_path")" ]; then
+                update_result=3
+            fi
+
+            case "$update_result" in
+            0)
+                section_changed=1
+                outbounds_count=$(jq -r '[.outbounds[] | select(
+                    .type != "selector" and
+                    .type != "urltest" and
+                    .type != "direct" and
+                    .type != "dns" and
+                    .type != "block"
+                )] | length' "$subscription_json_path" 2>/dev/null)
+                log "Subscription feed updated for section '$section': $outbounds_count outbounds (url=$(redact_url_for_log "$url"))"
+                ;;
+            2)
+                log "Subscription feed for section '$section' is unchanged (url=$(redact_url_for_log "$url"))"
+                ;;
+            3)
+                names_changed=1
+                log "Subscription feed for section '$section': only the node names or their order changed (url=$(redact_url_for_log "$url"))"
+                ;;
+            *)
+                log "Subscription feed failed for section '$section' (rc=$update_result): url=$(redact_url_for_log "$url")" "warn"
+                ;;
+            esac
+        done < "$urls_tmp"
+        rm -f "$urls_tmp"
+
+        if [ "$section_changed" -eq 1 ]; then
+            updated_sections=$((updated_sections + 1))
+            return
+        fi
+
+        if [ "$names_changed" -eq 1 ]; then
+            : > "$SUBSCRIPTION_NAMES_PENDING_FLAG"
+        fi
+    }
+    config_foreach _update_subscription_for_section "section"
+
+    if [ "$updated_sections" -eq 0 ]; then
+        log "Subscription update completed: no changes detected"
+        return 0
+    fi
+
+    log "Applying updated subscriptions..."
+    reload_sing_box_config_in_place
+    return $?
+}
+
+# Returns the cron line for a given subscription_update_interval, or 1 for unknown.
+get_subscription_cron_line_for_interval() {
+    local interval="$1"
+    case "$interval" in
+    "30m") echo "*/30 * * * * /usr/bin/podkop subscription_update 30m" ;;
+    "1h")  echo "17 * * * * /usr/bin/podkop subscription_update 1h" ;;
+    "3h")  echo "7 */3 * * * /usr/bin/podkop subscription_update 3h" ;;
+    "6h")  echo "24 */6 * * * /usr/bin/podkop subscription_update 6h" ;;
+    "12h") echo "40 */12 * * * /usr/bin/podkop subscription_update 12h" ;;
+    "1d")  echo "0 9 * * * /usr/bin/podkop subscription_update 1d" ;;
+    *) return 1 ;;
+    esac
+}
+
+# Returns the time a "1d" section refreshes at.
+get_section_subscription_update_time() {
+    local section="$1"
+    local subscription_update_time
+
+    config_get subscription_update_time "$section" "subscription_update_time" "$SUBSCRIPTION_UPDATE_TIME_DEFAULT"
+    echo "$subscription_update_time"
+}
+
+# Test ping latency of all servers in a subscription feed and sort by ping.
+# Usage: podkop subscription_url_test <section> [url]
+# Outputs JSON: {"section": "...", "results": [{"name": "...", "server": "...", "port": ..., "ping_ms": N}, ...]}
+subscription_url_test() {
+    local section="$1"
+    local target_url="${2:-}"
+    local url urlhash subscription_json_path
+    local urls_tmp
+    local result='{"section": "'"$section"'", "results": []}'
+
+    [ -n "$section" ] || {
+        echo '{"error": "section required"}'
+        return 1
+    }
+
+    mkdir -p "$TMP_SUBSCRIPTION_FOLDER"
+    ensure_subscription_cache_dir || return 1
+    reap_legacy_subscription_cache_files "$section"
+
+    urls_tmp="$(mktemp "${TMPDIR:-/tmp}/podkop-ping-test.XXXXXX")" || return 1
+    get_subscription_urls_for_section "$section" > "$urls_tmp"
+
+    while IFS= read -r url || [ -n "$url" ]; do
+        [ -n "$url" ] || continue
+        [ -n "$target_url" ] && [ "$url" != "$target_url" ] && continue
+
+        urlhash="$(get_subscription_url_hash "$url")"
+        subscription_json_path="$(get_subscription_json_path "$section" "$urlhash")"
+
+        if [ ! -s "$subscription_json_path" ]; then
+            log "No subscription cache for section '$section' feed: url=$(redact_url_for_log "$url")" "warn"
+            continue
+        fi
+
+        # Extract server:port pairs from the cached subscription JSON
+        jq -c '.outbounds[]? | select(.type | IN("vless", "trojan", "shadowsocks", "hysteria2", "socks") | not) | {server, server_port, tag}' "$subscription_json_path" 2>/dev/null | while IFS= read -r outbound; do
+            local server port tag ping_ms
+            server="$(printf '%s' "$outbound" | jq -r '.server // empty')"
+            port="$(printf '%s' "$outbound" | jq -r '.server_port // empty')"
+            tag="$(printf '%s' "$outbound" | jq -r '.tag // "unknown"')"
+            [ -n "$server" ] && [ -n "$port" ] || continue
+
+            # Ping test: send a single ICMP echo and measure round-trip time
+            # Compatible with busybox ping output: "64 bytes from host: icmp_seq=1 ttl=XX time=Y.Y ms"
+            ping_ms="$(ping -c 1 -W 3 "$server" 2>/dev/null | sed -n 's/.*time=\([0-9.]*\) *ms.*/\1/p' || echo "")"
+            [ -z "$ping_ms" ] && ping_ms="9999"
+
+            result="$(printf '%s' "$result" | jq -c --arg tag "$tag" --arg server "$server" --arg port "$port" --arg ping "$ping_ms" \
+                '.results += [{name: $tag, server: $server, port: ($port | tonumber), ping_ms: ($ping | tonumber)}]')"
+        done
+    done < "$urls_tmp"
+    rm -f "$urls_tmp"
+
+    # Sort results by ping_ms ascending
+    result="$(printf '%s' "$result" | jq -c '.results |= sort_by(.ping_ms)')"
+    printf '%s\n' "$result"
+}
+
 show_help() {
     cat << EOF
 Usage: $0 COMMAND
@@ -2709,6 +3146,8 @@ Available commands:
     restart                 Restart podkop service
     main                    Run main podkop process
     list_update             Update domain lists
+    subscription_update     Update subscription feeds
+    subscription_url_test   Test ping latency of subscription servers and sort by ping
     check_proxy             Check proxy connectivity
     check_nft               Check NFT rules
     check_nft_rules         Check NFT rules status
@@ -2749,6 +3188,12 @@ main)
     ;;
 list_update)
     list_update
+    ;;
+subscription_update)
+    subscription_update "${2:-}" "${3:-}" "${4:-}" "${5:-}"
+    ;;
+subscription_url_test)
+    subscription_url_test "${2:-}" "${3:-}"
     ;;
 check_proxy)
     check_proxy

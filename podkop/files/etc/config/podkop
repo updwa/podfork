@@ -39,3 +39,51 @@ config section 'main'
         #list fully_routed_ips '192.168.1.2'
         #option mixed_proxy_enabled '1'
         #option mixed_proxy_port '2080'
+
+#config section 'subscription_example'
+#        option connection_type 'proxy'
+#        option proxy_config_type 'subscription'
+#        # subscription_url may be a single option (legacy, still supported) or a
+#        # UCI list of one or more feed URLs. With multiple URLs every feed is
+#        # downloaded/validated independently and all nodes are MERGED into one
+#        # selector/urltest group. A dead feed never breaks the others.
+#        option subscription_url 'https://example.com/api/sub'
+#        #list subscription_url 'https://example.com/api/sub'
+#        #list subscription_url 'https://another-panel.example/api/sub'
+#        # Allow insecure TLS for the subscription fetch (default 0). Set to 1 to
+#        # add wget --no-check-certificate for IP-host panels whose HTTPS cert is
+#        # invalid/self-signed/missing-SAN.
+#        #option subscription_insecure '0'
+#        # Force a specific client User-Agent for the fetch. When set, ONLY this
+#        # UA is used (no probing). Leave unset to auto-probe well-known clients.
+#        #option subscription_user_agent 'Happ'
+#        # Pose as a given app on a given device: some panels serve a subscription
+#        # only to one client and check the HWID and device headers it sends.
+#        # Empty = the router's own values (X-HWID from its MAC, OpenWrt Linux,
+#        # kernel, model).
+#        #option subscription_hwid '270DD26E-160D-4257-B8AC-654800E12F24'
+#        #option subscription_device_os 'iOS'
+#        #option subscription_os_version '18.3'
+#        #option subscription_device_model 'iPhone 15'
+#        # Preferred body FORMAT to probe first (auto|xray|singbox, default auto).
+#        # Panels often serve a different config per User-Agent. 'xray' tries the
+#        # Xray-JSON UAs (Happ/v2rayN) FIRST to recover xhttp nodes a panel only
+#        # exposes in its Xray JSON; 'singbox' keeps the singbox/<ver> UA first;
+#        # 'auto' preserves the default order. Ignored when subscription_user_agent
+#        # is set (an explicit UA always wins).
+#        #option subscription_format_preference 'auto'
+#        # How often THIS section's feeds are re-fetched: 30m | 1h | 3h | 6h |
+#        # 12h | 1d. Every section keeps its own schedule.
+#        option subscription_update_interval '1h'
+#        # Node grouping: off | country | prefix. 'country' clusters by leading
+#        # flag emoji; 'prefix' clusters by the first N codepoints of each node
+#        # name (N = subscription_group_prefix_len).
+#        #option subscription_group_mode 'off'
+#        #option subscription_group_prefix_len '2'
+#        # Keyword whitelist: keep only nodes whose display name contains any of
+#        # these (OR). Empty/absent = keep all. Substring, ASCII case-insensitive.
+#        #list subscription_filter_include_keywords '🤖'
+#        #list subscription_filter_include_keywords 'grpc'
+#        # Keyword blacklist: drop any node whose display name contains any of
+#        # these (OR). Empty/absent = no exclusion.
+#        #list subscription_filter_exclude_keywords 'expired'
