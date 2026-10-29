@@ -11,7 +11,9 @@ cd /tmp/podkop-install
 wget -qO /tmp/podkop.tar.gz https://github.com/updwa/podfork/archive/refs/tags/v1.0.0.tar.gz
 tar -xzf /tmp/podkop.tar.gz
 cd podfork-*/
-cp -r etc usr /
+cp -r podkop/files/etc /
+cp -r podkop/files/usr /
+chmod +x /usr/bin/podkop 2>/dev/null || true
 rm -rf /tmp/podkop-install /tmp/podkop.tar.gz
 
 /etc/init.d/podkop enable
