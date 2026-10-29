@@ -1,18 +1,7 @@
 #!/bin/sh
-# install.sh — установка Podkop с поддержкой подписок через GitHub Releases
+# install.sh — установка Podkop с поддержкой подписок
 
 set -e
-
-# Определяем архитектуру OpenWrt
-ARCH="$(uname -m)"
-case "$ARCH" in
-    x86_64)   ARCH_SLUG="x86_64" ;;
-    aarch64)  ARCH_SLUG="aarch64_cortex-a53" ;;
-    armv7l)   ARCH_SLUG="arm_cortex-a7_vfpv3" ;;
-    mips)     ARCH_SLUG="mips_24kc" ;;
-    mipsel)   ARCH_SLUG="mipsel_24kc" ;;
-    *)        ARCH_SLUG="$ARCH" ;;
-esac
 
 REPO="https://github.com/updwa/podfork"
 LATEST_URL="https://api.github.com/repos/updwa/podfork/releases/latest"
@@ -29,23 +18,24 @@ echo "🔧 Установка зависимостей..."
 opkg update
 opkg install sing-box curl jq coreutils-base64 bind-dig
 
-# Получаем ссылку на последний .ipk для нашей архитектуры
-echo "🔍 Поиск последней версии для архитектуры $ARCH_SLUG..."
-IPK_URL="$(curl -s "$LATEST_URL" | jq -r --arg arch "$ARCH_SLUG" '.assets[] | select(.name | test($arch)) | .browser_download_url' | head -n1)"
+# Скачиваем последний архив с файлами
+echo "🔍 Поиск последнего релиза..."
+ARCHIVE_URL="$(curl -s "$LATEST_URL" | jq -r '.assets[] | select(.name | endswith(".tar.gz")) | .browser_download_url' | head -n1)"
 
-if [ -z "$IPK_URL" ]; then
-    echo "❌ Не найден .ipk для архитектуры $ARCH_SLUG в последнем релизе."
+if [ -z "$ARCHIVE_URL" ]; then
+    echo "❌ Не найден архив в последнем релизе."
     echo "   Доступные ассеты:"
     curl -s "$LATEST_URL" | jq -r '.assets[].name'
     exit 1
 fi
 
-echo "⬇️  Скачивание: $IPK_URL"
-wget -O /tmp/podkop.ipk "$IPK_URL"
+echo "⬇️  Скачивание: $ARCHIVE_URL"
+wget -O /tmp/podkop.tar.gz "$ARCHIVE_URL"
 
-echo "📦 Установка пакета..."
-opkg install /tmp/podkop.ipk
-rm -f /tmp/podkop.ipk
+echo "📦 Распаковка файлов..."
+cd /
+tar -xzf /tmp/podkop.tar.gz
+rm -f /tmp/podkop.tar.gz
 
 echo "🚀 Запуск сервиса..."
 /etc/init.d/podkop enable
